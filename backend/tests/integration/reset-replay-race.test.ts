@@ -5,24 +5,28 @@
  * Both `resetIndexer` and `replayFromLedger` are tested in isolation elsewhere,
  * but never interleaved with SorobanEventWorker's mutex-protected poll cycle.
  * This file fills that gap by simulating the exact scenario operators hit during
- * incident recovery: a live, running indexer whose scheduled poll is mid-flight
- * when an operator resets or replays.
+ * incident recovery: a live indexer whose scheduled poll is mid-flight when an
+ * operator resets or replays.
  *
- * Acceptance criteria:
- *   - New test fails against current code (the race is real).
- *   - Once Functional Edge Case #19 is fixed, the test passes.
- *
- * The race (Functional Edge Case #19):
+ * The race (Functional Edge Case #19), as it behaved before #1221:
  *   1. SorobanEventWorker.poll() -> runExclusive -> fetchAndProcessEvents()
  *   2. fetchAndProcessEvents reads IndexerState.lastLedger (e.g. 200)
  *   3. fetchAndProcessEvents awaits server.getEvents (async network I/O)
- *   4.   ^ WINDOW: resetIndexer(50) is called, writing lastLedger=50
- *   5. fetchAndProcessEvents finishes, upserts lastLedger=200 (stale value
- *      captured in step 2, because processEvent error prevents ledger advance)
- *   6. Reset is lost - cursor is 200 instead of 50.
+ *   4.   ^ WINDOW: resetIndexer(50) writes lastLedger=50 with no lock held
+ *   5. fetchAndProcessEvents resumes and upserts the cursor it captured in
+ *      step 2, rolling lastLedger forward past the reset
+ *   6. The reset is lost — the recovery action silently did nothing.
  *
- * Root cause: resetIndexer bypasses the worker's batchMutex, so its DB write
- * can be overwritten by a concurrent poll's cursor upsert.
+ * resetIndexer now takes the worker's batchMutex (`runExclusive`), so its write
+ * is ordered after any in-flight batch and cannot be clobbered by one. These
+ * tests pin that ordering down end to end: they drive a real
+ * SorobanEventWorker poll to the point where it is suspended on RPC, inject the
+ * operator action, and assert the operator's cursor is the one that survives.
+ *
+ * They exercise the exported `sorobanEventWorker` singleton on purpose — that
+ * is the instance `resetIndexer`/`replayFromLedger` lock against, so a fresh
+ * `new SorobanEventWorker()` would share no mutex with them and the ordering
+ * under test would not exist.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -123,14 +127,18 @@ vi.mock('../../src/services/sse.service.js', () => ({
   sseService: mockSseService,
 }));
 
-vi.mock('../../src/logger.js', () => ({
-  default: mockLogger,
-  requestContext: vi.fn(() => ({})),
-}));
+vi.mock('../../src/logger.js', async () => {
+  const { AsyncLocalStorage } = await import('async_hooks');
+  return {
+    default: mockLogger,
+    // Real ALS: both the worker and replayFromLedger call getStore()/run().
+    requestContext: new AsyncLocalStorage<{ requestId: string }>(),
+  };
+});
 
 // ─── Imports (after mocks) ───────────────────────────────────────────────────
 
-import { SorobanEventWorker } from '../../src/workers/soroban-event-worker.js';
+import { sorobanEventWorker } from '../../src/workers/soroban-event-worker.js';
 import { resetIndexer, replayFromLedger } from '../../src/services/indexerService.js';
 
 /**
@@ -228,8 +236,11 @@ function fakeStreamCreatedEvent(overrides: {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe('Reset/replay race with concurrent poll (Edge Case #19 - issue #1293)', () => {
-  let worker: SorobanEventWorker;
+  const worker = sorobanEventWorker;
   let getEventsDeferred: Deferred<{ events: any[]; latestCursor?: string | null }>;
+
+  /** Let queued microtasks and one timer tick run. */
+  const flush = () => new Promise((r) => setTimeout(r, 0));
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -242,188 +253,125 @@ describe('Reset/replay race with concurrent poll (Edge Case #19 - issue #1293)',
       updatedAt: new Date(),
     };
 
-    worker = new SorobanEventWorker();
     (worker as any).contractId = 'CTESTCONTRACT';
     (worker as any).pollIntervalMs = 600_000;
 
-    // Wire up deferred getEvents mock.
+    // getEvents resolves whichever deferred is current when it is *called*,
+    // so a test can queue the next batch's response by reassigning.
     getEventsDeferred = defer();
-    const server = (worker as any).server as { getEvents: ReturnType<typeof vi.fn> };
-    server.getEvents = vi.fn(() => getEventsDeferred.promise);
+    (worker as any).server = {
+      getEvents: vi.fn(() => getEventsDeferred.promise),
+    };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     worker.stop();
+    await worker.waitForDrain().catch(() => undefined);
   });
 
-  it(
-    'resetIndexer cursor must survive a concurrent scheduled poll - ' +
-      'FAILS before fix (poll overwrites reset)',
-    async () => {
-      // ── Arrange ──────────────────────────────────────────────────────
+  it('resetIndexer cursor survives a poll that is already mid-flight', async () => {
+    // ── Arrange ────────────────────────────────────────────────────────
+    // The indexer is at ledger 200; the poll about to start reads from there.
+    dbIndexerState = {
+      lastLedger: 200,
+      lastCursor: 'cursor-old',
+      updatedAt: new Date(),
+    };
 
-      // Simulate: indexer is at ledger 200, poll starts reading from there.
-      dbIndexerState = {
-        lastLedger: 200,
-        lastCursor: 'cursor-old',
-        updatedAt: new Date(),
-      };
+    // ── Act ────────────────────────────────────────────────────────────
+    // 1. start() -> poll() -> runExclusive -> fetchAndProcessEvents, which
+    //    reads lastLedger=200 and then suspends on server.getEvents.
+    void worker.start();
+    await flush();
 
-      // ── Act ──────────────────────────────────────────────────────────
+    // 2. Mid-flight, the operator resets to ledger 50. This is the whole
+    //    point of the test: the call is issued while the poll still holds
+    //    the batch mutex, so it must not be applied yet.
+    const resetPromise = resetIndexer(50);
+    await flush();
+    expect(upsertLog).toHaveLength(0);
 
-      // 1. Start the worker.  This calls poll() -> runExclusive ->
-      //    fetchAndProcessEvents -> ensureIndexerState (reads lastLedger=200)
-      //    -> server.getEvents (suspended on deferred promise).
-      void worker.start();
-      await new Promise((r) => setTimeout(r, 0));
+    // 3. Release the poll. It processes its event and writes its cursor
+    //    (ledger 210) — that write is legitimate, it just must not be the
+    //    last word.
+    getEventsDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'e1', txHash: 'tx1', ledger: 210 })],
+      latestCursor: 'cursor-new',
+    });
 
-      // 2. While the poll is suspended on getEvents, the operator calls
-      //    resetIndexer(50).  This directly upserts the DB - no mutex.
-      await resetIndexer(50);
+    await resetPromise;
+    await worker.waitForDrain();
 
-      // Verify the DB now has lastLedger=50 (the reset).
-      expect(dbIndexerState.lastLedger).toBe(50);
+    // ── Assert ─────────────────────────────────────────────────────────
+    // The poll's cursor write lands first, the reset second — the ordering
+    // the batch mutex guarantees. Before #1221 the reset slipped in ahead of
+    // the poll and was then overwritten by it.
+    expect(upsertLog.map((e) => e.caller)).toEqual(['worker', 'resetIndexer']);
+    expect(upsertLog[0]!.lastLedger).toBe(210);
+    expect(upsertLog[1]!.lastLedger).toBe(50);
 
-      // 3. Resolve getEvents with a real event so the poll reaches the
-      //    cursor upsert at the end of fetchAndProcessEvents.
-      //    The poll captured lastLedger=200 before the reset, so it will
-      //    upsert lastLedger=200, overwriting the reset's 50.
-      getEventsDeferred.resolve({
-        events: [
-          fakeStreamCreatedEvent({ id: 'e1', txHash: 'tx1', ledger: 210 }),
-        ],
-        latestCursor: 'cursor-new',
-      });
+    // Final DB state: the operator's reset is what survives.
+    expect(dbIndexerState.lastLedger).toBe(50);
+    expect(dbIndexerState.lastCursor).toBeNull();
+  });
 
-      // Wait for the poll to fully complete.
-      await worker.waitForDrain();
+  it('replayFromLedger cursor survives a poll that is already mid-flight', async () => {
+    // ── Arrange ────────────────────────────────────────────────────────
+    dbIndexerState = {
+      lastLedger: 300,
+      lastCursor: 'cursor-abc',
+      updatedAt: new Date(),
+    };
 
-      // ── Assert ───────────────────────────────────────────────────────
+    // ── Act ────────────────────────────────────────────────────────────
+    // 1. First poll runs to completion normally, advancing to ledger 310.
+    void worker.start();
+    await flush();
+    getEventsDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'e2', txHash: 'tx2', ledger: 310 })],
+      latestCursor: 'cursor-first',
+    });
+    await worker.waitForDrain();
+    expect(dbIndexerState.lastLedger).toBe(310);
 
-      // The upsert log tells the story:
-      //   1. resetIndexer writes lastLedger=50 (the operator's reset)
-      //   2. Worker's fetchAndProcessEvents writes lastLedger=200 (stale!)
-      //
-      // The poll's upsert overwrites the reset because it captured
-      // lastLedger=200 at the start and never re-read.
-      expect(upsertLog.length).toBe(2);
+    // 2. Start a second poll and leave it suspended on getEvents.
+    getEventsDeferred = defer();
+    void worker.start();
+    await flush();
 
-      // First upsert: resetIndexer.
-      expect(upsertLog[0]!.caller).toBe('resetIndexer');
-      expect(upsertLog[0]!.lastLedger).toBe(50);
+    // 3. Operator replays from ledger 100 while that poll is in flight:
+    //    resetIndexer(100) queues behind it on the mutex, and the replay's
+    //    own triggerPoll queues behind the reset.
+    const replayPromise = replayFromLedger(100);
+    await flush();
 
-      // Second upsert: worker's stale cursor write.
-      expect(upsertLog[1]!.caller).toBe('worker');
-      expect(upsertLog[1]!.lastLedger).toBe(200);
+    // Nothing applied yet — the second poll still holds the mutex.
+    const beforeRelease = upsertLog.length;
+    expect(dbIndexerState.lastLedger).toBe(310);
 
-      // Final DB state: the reset value (50) must survive.
-      // This assertion asserts the DESIRED behavior.  Before the fix, it
-      // fails because the poll's stale upsert (200) overwrites the reset.
-      // After the fix, the poll must respect the externally-set cursor.
-      expect(dbIndexerState.lastLedger).toBe(50);
-    },
-  );
+    // 4. Release the second poll (it writes ledger 320), and hand the
+    //    replay's own poll an empty batch so it makes no cursor write.
+    const secondPollDeferred = getEventsDeferred;
+    getEventsDeferred = defer();
+    getEventsDeferred.resolve({ events: [], latestCursor: 'cursor-replay' });
+    secondPollDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'e3', txHash: 'tx3', ledger: 320 })],
+      latestCursor: 'cursor-poll2',
+    });
 
-  it(
-    'replayFromLedger cursor must survive a concurrent scheduled poll - ' +
-      'FAILS before fix (poll overwrites replay reset)',
-    async () => {
-      // ── Arrange ──────────────────────────────────────────────────────
+    await replayPromise;
+    await worker.waitForDrain();
 
-      dbIndexerState = {
-        lastLedger: 300,
-        lastCursor: 'cursor-abc',
-        updatedAt: new Date(),
-      };
+    // ── Assert ─────────────────────────────────────────────────────────
+    // The second poll's stale write lands, then the replay's reset — and
+    // nothing after it, because the replay's own poll found no events.
+    const afterRelease = upsertLog.slice(beforeRelease);
+    expect(afterRelease.map((e) => e.caller)).toEqual(['worker', 'resetIndexer']);
+    expect(afterRelease[0]!.lastLedger).toBe(320);
+    expect(afterRelease[1]!.lastLedger).toBe(100);
 
-      // ── Act ──────────────────────────────────────────────────────────
-
-      // 1. Start the worker - first poll reads lastLedger=300, awaits getEvents.
-      void worker.start();
-      await new Promise((r) => setTimeout(r, 0));
-
-      // 2. Resolve the first poll's getEvents so it finishes.
-      getEventsDeferred.resolve({
-        events: [
-          fakeStreamCreatedEvent({ id: 'e2', txHash: 'tx2', ledger: 310 }),
-        ],
-        latestCursor: 'cursor-first',
-      });
-
-      await worker.waitForDrain();
-
-      // 3. Set up a new deferred for the SECOND poll.
-      getEventsDeferred = defer();
-      const server = (worker as any).server as { getEvents: ReturnType<typeof vi.fn> };
-      server.getEvents = vi.fn(() => getEventsDeferred.promise);
-
-      // 4. Start a second poll that will be mid-flight when we call
-      //    replayFromLedger.
-      void worker.start();
-      await new Promise((r) => setTimeout(r, 0));
-
-      // Second poll is now suspended at getEvents, having read lastLedger=300.
-
-      // 5. Operator calls replayFromLedger(100):
-      //    a) resetIndexer(100) -> upserts lastLedger=100
-      //    b) triggerPoll() -> queued behind the second poll via mutex
-      const replayPromise = replayFromLedger(100);
-
-      // Yield to let resetIndexer(100) execute.
-      await new Promise((r) => setTimeout(r, 0));
-
-      // Verify resetIndexer wrote lastLedger=100.
-      expect(dbIndexerState.lastLedger).toBe(100);
-
-      // 6. Resolve the second poll's getEvents with a real event.
-      //    The second poll will finish, upserting its stale lastLedger=300,
-      //    overwriting the reset's 100.
-      getEventsDeferred.resolve({
-        events: [
-          fakeStreamCreatedEvent({ id: 'e3', txHash: 'tx3', ledger: 320 }),
-        ],
-        latestCursor: 'cursor-poll2',
-      });
-
-      // The replay's triggerPoll will run after the second poll finishes.
-      // Set up yet another deferred for the replay's poll.
-      getEventsDeferred = defer();
-      server.getEvents = vi.fn(() => getEventsDeferred.promise);
-
-      // Yield so the replay's poll starts and suspends at getEvents.
-      await new Promise((r) => setTimeout(r, 0));
-
-      // Resolve the replay's poll with empty events (no more work to do).
-      getEventsDeferred.resolve({
-        events: [],
-        latestCursor: 'cursor-replay',
-      });
-
-      // Wait for replay to fully complete.
-      await replayPromise;
-      await worker.waitForDrain();
-
-      // ── Assert ───────────────────────────────────────────────────────
-
-      // The upsert log tells the story:
-      //   1. First poll writes 300 (event ledger, normal advancement)
-      //   2. resetIndexer writes 100 (the operator's reset)
-      //   3. Second poll writes 300 (stale - overwrites the reset!)
-      //   4. Replay's poll writes whatever it read
-      //
-      // The key bug: step 3 overwrites step 2.
-      expect(upsertLog.length).toBeGreaterThanOrEqual(3);
-
-      // Find the resetIndexer upsert.
-      const resetEntry = upsertLog.find((e) => e.caller === 'resetIndexer');
-      expect(resetEntry).toBeDefined();
-      expect(resetEntry!.lastLedger).toBe(100);
-
-      // Final DB state: the reset value (100) must survive.
-      // This assertion asserts the DESIRED behavior.  Before the fix, it
-      // fails because the second poll's stale upsert (300) overwrites the reset.
-      // After the fix, the poll must respect the externally-set cursor.
-      expect(dbIndexerState.lastLedger).toBe(100);
-    },
-  );
+    // Final DB state: the replay's cursor is what survives.
+    expect(dbIndexerState.lastLedger).toBe(100);
+    expect(dbIndexerState.lastCursor).toBeNull();
+  });
 });
