@@ -3,12 +3,12 @@ import { ClaimableAmountService } from '../src/services/claimable.service.js';
 
 function makeStreamState(overrides: Partial<Parameters<ClaimableAmountService['getClaimableAmount']>[0]> = {}) {
   return {
-    streamId: 1,
+    streamId: 1n,
     ratePerSecond: '10',
     depositedAmount: '100',
     withdrawnAmount: '0',
     lastUpdateTime: 0,
-    startTime: 0,
+    startTime: 0n,
     isActive: true,
     isPaused: false,
     pausedAt: null,
@@ -35,7 +35,7 @@ describe('ClaimableAmountService', () => {
 
     const result = service.getClaimableAmount({
       ...makeStreamState({
-        streamId: 1,
+        streamId: 1n,
         ratePerSecond: '5',
         depositedAmount: '500',
         withdrawnAmount: '100',
@@ -61,7 +61,7 @@ describe('ClaimableAmountService', () => {
 
     const result = service.getClaimableAmount({
       ...makeStreamState({
-        streamId: 2,
+        streamId: 2n,
         depositedAmount: '1000',
         withdrawnAmount: '900',
       }),
@@ -80,7 +80,7 @@ describe('ClaimableAmountService', () => {
 
     const result = service.getClaimableAmount({
       ...makeStreamState({
-        streamId: 3,
+        streamId: 3n,
         withdrawnAmount: '100',
         isActive: false,
       }),
@@ -98,7 +98,7 @@ describe('ClaimableAmountService', () => {
 
     const result = service.getClaimableAmount({
       ...makeStreamState({
-        streamId: 4,
+        streamId: 4n,
         withdrawnAmount: '150',
       }),
     });
@@ -114,7 +114,7 @@ describe('ClaimableAmountService', () => {
     });
 
     const input = makeStreamState({
-      streamId: 5,
+      streamId: 5n,
       ratePerSecond: '7',
       depositedAmount: '700',
     });
@@ -129,6 +129,40 @@ describe('ClaimableAmountService', () => {
     vi.advanceTimersByTime(20_001);
     const third = service.getClaimableAmount(input, 5);
     expect(third.cached).toBe(false);
+  });
+
+  it('buckets the cache-key timestamp so requests within the same 5s window share an entry (Issue #1249)', () => {
+    vi.setSystemTime(5_000);
+    const service = new ClaimableAmountService({
+      cacheTtlMs: 60_000,
+    });
+
+    const input = makeStreamState({
+      streamId: 8n,
+      ratePerSecond: '10',
+      depositedAmount: '1000',
+      withdrawnAmount: '0',
+    });
+
+    // Second 5 and second 9 land in the same 5s bucket (5..9), so the second
+    // request must reuse the cached value instead of creating a new key.
+    const first = service.getClaimableAmount(input, 5);
+    expect(first.cached).toBe(false);
+    expect(first.calculatedAt).toBe(5);
+    expect(first.claimableAmount).toBe('50'); // 5s elapsed × 10/s
+
+    const sameBucket = service.getClaimableAmount(input, 9);
+    expect(sameBucket.cached).toBe(true);
+    // The cached payload reflects the second the value was computed at.
+    expect(sameBucket.calculatedAt).toBe(5);
+    expect(sameBucket.claimableAmount).toBe('50');
+
+    // Second 10 starts a new bucket, so a fresh calculation is performed
+    // (and the value reflects the extra elapsed second).
+    const nextBucket = service.getClaimableAmount(input, 10);
+    expect(nextBucket.cached).toBe(false);
+    expect(nextBucket.calculatedAt).toBe(10);
+    expect(nextBucket.claimableAmount).toBe('100'); // 10s elapsed × 10/s
   });
 
   it('reflects an indexed withdrawal immediately, without waiting for the cache TTL', () => {
@@ -146,7 +180,7 @@ describe('ClaimableAmountService', () => {
     });
 
     const preWithdrawalState = makeStreamState({
-      streamId: 7,
+      streamId: 7n,
       ratePerSecond: '10',
       depositedAmount: '1000',
       withdrawnAmount: '0',
@@ -166,7 +200,7 @@ describe('ClaimableAmountService', () => {
     // and lastUpdateTime are advanced on the stream row, exactly as
     // handleTokensWithdrawn does in soroban-event-worker.ts.
     const postWithdrawalState = makeStreamState({
-      streamId: 7,
+      streamId: 7n,
       ratePerSecond: '10',
       depositedAmount: '1000',
       withdrawnAmount: '400',
@@ -191,7 +225,7 @@ describe('ClaimableAmountService', () => {
 
     const result = service.getClaimableAmount({
       ...makeStreamState({
-        streamId: 6,
+        streamId: 6n,
         ratePerSecond: i128Max,
         depositedAmount: i128Max,
         withdrawnAmount: '42',
@@ -228,7 +262,7 @@ describe('ClaimableAmountService', () => {
 
       const result = service.getClaimableAmount({
         ...makeStreamState({
-          streamId: 10_000 + iteration,
+          streamId: BigInt(10_000 + iteration),
           ratePerSecond: rate.toString(),
           depositedAmount: deposited.toString(),
           withdrawnAmount: withdrawn.toString(),

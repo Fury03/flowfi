@@ -1,6 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import { prisma } from '../lib/prisma.js';
 import { INDEXER_STATE_ID } from '../lib/indexer-state.js';
+import { isRedisAvailable } from '../lib/redis.js';
+import { checkRpcHealth } from '../services/sorobanService.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
 
 const router = Router();
@@ -31,75 +33,13 @@ const router = Router();
  *         content:
  *           application/json:
  *             schema:
- *               type: object
- *               properties:
- *                 status:
- *                   type: string
- *                   example: ok
- *                 db:
- *                   type: string
- *                   example: connected
- *                 indexerEnabled:
- *                   type: boolean
- *                   description: Whether the event indexer is configured
- *                   example: true
- *                 indexerLag:
- *                   type: integer
- *                   nullable: true
- *                   description: Seconds since last indexer update, or null when no state row exists yet
- *                   example: 5
- *                 eventsProcessed:
- *                   type: integer
- *                   description: Lifetime count of successfully processed indexer events
- *                 eventsFailed:
- *                   type: integer
- *                   description: Lifetime count of indexer events that threw during processing
- *                 lastErrorAt:
- *                   type: string
- *                   nullable: true
- *                   description: ISO timestamp of the most recent per-event processing failure
- *                 indexerDegraded:
- *                   type: boolean
- *                   description: True when recent event-processing failure rate indicates a spike
- *                 uptime:
- *                   type: number
- *                   description: Server uptime in seconds
- *                   example: 3600
- *                 checks:
- *                   type: object
- *                   description: Per-subsystem status breakdown, so callers can tell "DB unreachable" apart from "indexer lagging" instead of inferring it from the top-level status alone.
- *                   properties:
- *                     database:
- *                       type: object
- *                       properties:
- *                         status:
- *                           type: string
- *                           enum: [ok, down]
- *                     indexer:
- *                       type: object
- *                       properties:
- *                         status:
- *                           type: string
- *                           enum: [ok, degraded, disabled]
- *                         enabled:
- *                           type: boolean
- *                         lagSeconds:
- *                           type: integer
- *                           nullable: true
- *                     redis:
- *                       type: object
- *                       properties:
- *                         status:
- *                           type: string
- *                           enum: [ok, unavailable, not_configured]
- *                     sorobanRpc:
- *                       type: object
- *                       properties:
- *                         status:
- *                           type: string
- *                           enum: [ok, down]
+ *               $ref: '#/components/schemas/HealthResponse'
  *       503:
  *         description: Service is degraded or unhealthy
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/HealthResponse'
  */
 router.get('/', async (_req: Request, res: Response) => {
   let dbStatus = 'connected';
@@ -161,7 +101,7 @@ router.get('/', async (_req: Request, res: Response) => {
         status: dbStatus === 'connected' ? 'ok' : 'down',
       },
       indexer: {
-        status: !indexerEnabled ? 'disabled' : indexerDegraded ? 'degraded' : 'ok',
+        status: !indexerEnabled ? 'disabled' : indexerFailureDegraded || indexerLagDegraded ? 'degraded' : 'ok',
         enabled: indexerEnabled,
         lagSeconds: indexerLag === -1 ? null : indexerLag,
       },

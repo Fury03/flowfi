@@ -6,14 +6,18 @@ import { sseService } from "../services/sse.service.js";
 import logger, { requestContext } from "../logger.js";
 import { Prisma } from "../generated/prisma/index.js";
 import "../lib/stream-id.js";
+import { rpcPool } from "../lib/rpc-pool.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
+
+/** Default max failed processing attempts before an event is abandoned. */
+const DEAD_LETTER_MAX_RETRIES_DEFAULT = 5;
 
 // ─── XDR Decoding Helpers ────────────────────────────────────────────────────
 
 /** Decode an ScVal symbol to a string. */
 export function decodeSymbol(val: xdr.ScVal): string {
-  return val.sym().toString();
+  return (val as xdr.ScValSymbol).sym.toString();
 }
 
 /**
@@ -21,12 +25,12 @@ export function decodeSymbol(val: xdr.ScVal): string {
  * `xdr.UInt64` extends Long; `.toString()` gives the decimal representation.
  */
 export function decodeU64(val: xdr.ScVal): bigint {
-  return BigInt(val.u64().toString());
+  return BigInt((val as xdr.ScValU64).u64.toString());
 }
 
 /** Decode an ScVal U32 to a JavaScript number. */
 export function decodeU32(val: xdr.ScVal): number {
-  return val.u32();
+  return (val as xdr.ScValU32).u32;
 }
 
 /**
@@ -35,9 +39,9 @@ export function decodeU32(val: xdr.ScVal): number {
  * Full value = hi * 2^64 + lo.
  */
 export function decodeI128(val: xdr.ScVal): string {
-  const parts = val.i128();
-  const hi = BigInt.asIntN(64, BigInt(parts.hi().toString()));
-  const lo = BigInt.asUintN(64, BigInt(parts.lo().toString()));
+  const parts = (val as xdr.ScValI128).i128;
+  const hi = BigInt.asIntN(64, BigInt(parts.hi.toString()));
+  const lo = BigInt.asUintN(64, BigInt(parts.lo.toString()));
   return ((hi << 64n) | lo).toString();
 }
 
@@ -46,13 +50,13 @@ export function decodeI128(val: xdr.ScVal): string {
  * string.
  */
 export function decodeAddress(val: xdr.ScVal): string {
-  const addr = val.address();
-  if (addr.switch().value === xdr.ScAddressType.scAddressTypeAccount().value) {
-    return StrKey.encodeEd25519PublicKey(addr.accountId().ed25519());
+  const addr = (val as xdr.ScValAddress).address;
+  if (addr.type === 'scAddressTypeAccount') {
+    return StrKey.encodeEd25519PublicKey((addr.accountId as xdr.PublicKeyEd25519).ed25519.value);
   }
-  // addr.contractId() returns a Hash (Opaque[]); cast to Uint8Array for encodeContract
-  const hash = addr.contractId();
-  return StrKey.encodeContract(Buffer.from(hash as unknown as Uint8Array));
+  // addr.contractId is a Hash (Opaque[]); cast to Uint8Array for encodeContract
+  const hash = (addr as xdr.ScAddressContract).contractId;
+  return StrKey.encodeContract(Buffer.from(hash.value as unknown as Uint8Array));
 }
 
 /**
@@ -61,10 +65,10 @@ export function decodeAddress(val: xdr.ScVal): string {
  */
 export function decodeMap(val: xdr.ScVal): Record<string, xdr.ScVal> {
   const result: Record<string, xdr.ScVal> = {};
-  const entries = val.map();
+  const entries = (val as xdr.ScValMap).map;
   if (!entries) return result;
   for (const entry of entries) {
-    result[entry.key().sym().toString()] = entry.val();
+    result[(entry.key as xdr.ScValSymbol).sym.toString()] = entry.val;
   }
   return result;
 }
@@ -89,10 +93,12 @@ export interface IndexerEventCounters {
 // ─── Worker Class ─────────────────────────────────────────────────────────────
 
 export class SorobanEventWorker {
-  private readonly server: rpc.Server;
   private readonly contractId: string;
+  private readonly server: rpc.Server;
   private readonly pollIntervalMs: number;
   private readonly startLedger: number;
+  /** Max failed processing attempts before an event is abandoned (dead-lettered). */
+  private readonly deadLetterMaxRetries: number;
 
   private isRunning = false;
   private pollTimer: NodeJS.Timeout | undefined;
@@ -113,23 +119,21 @@ export class SorobanEventWorker {
   /** Recent attempt outcomes for sliding-window spike detection. */
   private recentOutcomes: { ok: boolean; at: number }[] = [];
 
-  /**
-   * Stable id attached to every log line emitted by the background poll
-   * loop, since these callbacks fire outside of any HTTP request and would
-   * otherwise have no requestContext (and thus no correlation id) at all.
-   */
-  private readonly workerId = `soroban-worker:${randomUUID()}`;
-
   constructor() {
+    this.contractId = process.env.STREAM_CONTRACT_ID ?? "";
     const rpcUrl =
       process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
-    this.contractId = process.env.STREAM_CONTRACT_ID ?? "";
+    this.server = new rpc.Server(rpcUrl, { allowHttp: true });
     this.pollIntervalMs = parseInt(
       process.env.INDEXER_POLL_INTERVAL_MS ?? "5000",
       10,
     );
     this.startLedger = parseInt(process.env.INDEXER_START_LEDGER ?? "0", 10);
-    this.server = new rpc.Server(rpcUrl, { allowHttp: true });
+    this.deadLetterMaxRetries = parseInt(
+      process.env.INDEXER_DEAD_LETTER_MAX_RETRIES ??
+        String(DEAD_LETTER_MAX_RETRIES_DEFAULT),
+      10,
+    );
   }
 
   /**
@@ -206,15 +210,36 @@ export class SorobanEventWorker {
    * Trigger an immediate poll cycle (used for replay and manual updates).
    * Serialized with the scheduled poll via `runExclusive` so two cursor writes
    * cannot overlap and regress `lastCursor` (#843).
+   *
+   * @param customRequestId Optional correlation ID to bind logs to a specific request/replay.
+   * @returns The correlation requestId associated with this poll batch.
    */
-  async triggerPoll(): Promise<void> {
-    if (!this.isRunning) return;
+  async triggerPoll(customRequestId?: string): Promise<string> {
+    if (!this.isRunning) {
+      return (
+        customRequestId ||
+        requestContext?.getStore?.()?.requestId ||
+        randomUUID()
+      );
+    }
+
+    const requestId =
+      customRequestId ||
+      requestContext?.getStore?.()?.requestId ||
+      randomUUID();
 
     try {
-      await this.runExclusive(() => this.fetchAndProcessEvents());
+      await this.runExclusive(() => {
+        const runBatch = () => this.fetchAndProcessEvents();
+        return requestContext && typeof requestContext.run === "function"
+          ? requestContext.run({ requestId }, runBatch)
+          : runBatch();
+      });
     } catch (err) {
       logger.error("[SorobanWorker] Manual poll error:", err);
     }
+
+    return requestId;
   }
 
   // ─── Internal ──────────────────────────────────────────────────────────────
@@ -222,8 +247,11 @@ export class SorobanEventWorker {
   /**
    * Run `fn` exclusively with any other poll/replay batch.
    * Registers the work on `activeBatch` so `waitForDrain` awaits replays too.
+   *
+   * Public so that admin reset/replay paths can acquire the same lock,
+   * preventing a concurrent poll from overwriting the reset cursor (#1221).
    */
-  private runExclusive(fn: () => Promise<void>): Promise<void> {
+  runExclusive(fn: () => Promise<void>): Promise<void> {
     const run = this.batchMutex.then(fn);
     // Keep the mutex chain alive even when a batch rejects.
     const gate = run.then(
@@ -278,11 +306,16 @@ export class SorobanEventWorker {
 
   private async poll(): Promise<void> {
     try {
-      await this.runExclusive(() =>
-        this.fetchAndProcessEvents().catch((err) => {
-          logger.error("[SorobanWorker] Unhandled error during poll:", err);
-        }),
-      );
+      const requestId = randomUUID();
+      await this.runExclusive(() => {
+        const execute = () =>
+          this.fetchAndProcessEvents().catch((err) => {
+            logger.error("[SorobanWorker] Unhandled error during poll:", err);
+          });
+        return requestContext && typeof requestContext.run === "function"
+          ? requestContext.run({ requestId }, execute)
+          : execute();
+      });
     } finally {
       this.scheduleNext();
     }
@@ -293,6 +326,18 @@ export class SorobanEventWorker {
    * cursor (or start ledger on first run) and process each one in order.
    */
   private async fetchAndProcessEvents(): Promise<void> {
+    const currentCtx = requestContext?.getStore?.();
+    if (
+      !currentCtx?.requestId &&
+      requestContext &&
+      typeof requestContext.run === "function"
+    ) {
+      const requestId = randomUUID();
+      return requestContext.run({ requestId }, () =>
+        this.fetchAndProcessEvents(),
+      );
+    }
+
     // Ensure an IndexerState row exists on first run.
     const state = await ensureIndexerState(this.startLedger);
 
@@ -315,12 +360,15 @@ export class SorobanEventWorker {
       ? { ...baseFilter, cursor: state.lastCursor }
       : { ...baseFilter, startLedger: state.lastLedger || this.startLedger };
 
-    const response = await this.server.getEvents(params);
+    const response = await (this.server
+      ? this.server.getEvents(params)
+      : rpcPool.execute("getEvents", (server) => server.getEvents(params)));
 
     if (response.events.length === 0) return;
 
     let lastCursor: string | null = state.lastCursor;
     let lastLedger: number = state.lastLedger;
+    let sawSuccess = false;
 
     // Sort events so that 'stream_created' events are processed first in the batch.
     // This ensures that subsequent events (like 'fee_collected') that depend on
@@ -341,7 +389,9 @@ export class SorobanEventWorker {
         await this.processEvent(event);
         this.eventsProcessed += 1;
         this.recordOutcome(true);
-        // Use the event ID as the cursor if pagingToken is not available
+        sawSuccess = true;
+        // Advance the cursor to the most recent event that was successfully processed.
+        // This keeps a single malformed event from pinning the entire batch forever.
         lastCursor = event.id;
         lastLedger = event.ledger;
       } catch (err) {
@@ -352,12 +402,27 @@ export class SorobanEventWorker {
           `[SorobanWorker] Failed to process event ${event.id}:`,
           err,
         );
+
+        // Record the event in the dead-letter table (raw payload preserved
+        // for manual triage). Once it has failed `deadLetterMaxRetries`
+        // times, abandon it and advance the cursor past it so the indexer
+        // is never frozen by a permanently-bad event.
+        if (await this.deadLetterEvent(event, err)) {
+          logger.warn(
+            `[SorobanWorker] Event ${event.id} exceeded ${this.deadLetterMaxRetries} attempts — abandoning (see IndexerDeadLetterEvent for triage).`,
+          );
+          lastCursor = event.id;
+          lastLedger = event.ledger;
+        }
         // Continue processing subsequent events rather than halting.
       }
     }
 
-    // Use the response's final cursor if provided, otherwise the last event's ID
-    const finalCursor = (response as any).latestCursor || lastCursor;
+    // If we successfully processed any events in the batch, advance to the last
+    // successful event so a single poison-pill failure cannot freeze the cursor.
+    const finalCursor = sawSuccess
+      ? ((response as any).latestCursor || lastCursor)
+      : lastCursor;
 
     await prisma.indexerState.upsert({
       where: { id: INDEXER_STATE_ID },
@@ -372,6 +437,48 @@ export class SorobanEventWorker {
     logger.info(
       `[SorobanWorker] Processed ${response.events.length} event(s) — latest ledger: ${lastLedger}`,
     );
+  }
+
+  /**
+   * Record a failed event in the dead-letter table (with its raw payload for
+   * manual triage), incrementing its attempt counter.
+   *
+   * @returns `true` when the event has reached the retry cap and should be
+   *   abandoned (cursor advanced past it); `false` to leave it for a retry
+   *   on a future poll. Never throws — a dead-letter write failure must not
+   *   abort the batch; in that case the event is simply left for the next
+   *   poll.
+   */
+  private async deadLetterEvent(
+    event: rpc.Api.EventResponse,
+    err: unknown,
+  ): Promise<boolean> {
+    try {
+      const row = await prisma.indexerDeadLetterEvent.upsert({
+        where: { eventId: event.id },
+        create: {
+          eventId: event.id,
+          ledger: event.ledger,
+          transactionHash: event.txHash,
+          rawPayload: JSON.stringify(event),
+          errorMessage: err instanceof Error ? err.message : String(err),
+          attempts: 1,
+          lastAttemptAt: new Date(),
+        },
+        update: {
+          errorMessage: err instanceof Error ? err.message : String(err),
+          attempts: { increment: 1 },
+          lastAttemptAt: new Date(),
+        },
+      });
+      return row.attempts >= this.deadLetterMaxRetries;
+    } catch (dlErr) {
+      logger.error(
+        `[SorobanWorker] Failed to write dead-letter entry for event ${event.id}:`,
+        dlErr,
+      );
+      return false;
+    }
   }
 
   /**
@@ -690,11 +797,18 @@ export class SorobanEventWorker {
       // Check for a duplicate BEFORE mutating any Stream fields so that a
       // replayed event never re-applies the top-up.
       const existingEvent = await tx.streamEvent.findUnique({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'TOPPED_UP' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "TOPPED_UP",
+          },
+        },
         select: { id: true },
       });
       if (existingEvent) {
-        logger.warn(`[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=TOPPED_UP`);
+        logger.warn(
+          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=TOPPED_UP`,
+        );
         return;
       }
 
@@ -712,7 +826,7 @@ export class SorobanEventWorker {
         ratePerSecondBigInt === 0n
           ? null
           : BigInt(stream.startTime) +
-            (BigInt(newDepositedAmount) / ratePerSecondBigInt) +
+            BigInt(newDepositedAmount) / ratePerSecondBigInt +
             BigInt(stream.totalPausedDuration);
 
       await tx.stream.update({
@@ -725,10 +839,15 @@ export class SorobanEventWorker {
       });
 
       await tx.streamEvent.upsert({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'TOPPED_UP' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "TOPPED_UP",
+          },
+        },
         create: {
           streamId,
-          eventType: 'TOPPED_UP',
+          eventType: "TOPPED_UP",
           amount,
           transactionHash: event.txHash,
           ledgerSequence: event.ledger,
@@ -771,11 +890,18 @@ export class SorobanEventWorker {
       // Check for a duplicate BEFORE mutating any Stream fields so that a
       // replayed event never double-increments withdrawnAmount.
       const existingEvent = await tx.streamEvent.findUnique({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'WITHDRAWN' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "WITHDRAWN",
+          },
+        },
         select: { id: true },
       });
       if (existingEvent) {
-        logger.warn(`[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=WITHDRAWN`);
+        logger.warn(
+          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=WITHDRAWN`,
+        );
         return;
       }
 
@@ -797,10 +923,15 @@ export class SorobanEventWorker {
       });
 
       await tx.streamEvent.upsert({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'WITHDRAWN' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "WITHDRAWN",
+          },
+        },
         create: {
           streamId,
-          eventType: 'WITHDRAWN',
+          eventType: "WITHDRAWN",
           amount,
           transactionHash: event.txHash,
           ledgerSequence: event.ledger,
@@ -1115,7 +1246,7 @@ export class SorobanEventWorker {
     }
 
     const sender = decodeAddress(body["sender"]);
-    const newEndTime = Number(decodeU64(body["new_end_time"]));
+    const newEndTime = decodeU64(body["new_end_time"]);
     const timestamp = Math.floor(Date.now() / 1000);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -1125,11 +1256,9 @@ export class SorobanEventWorker {
         select: { pausedAt: true, totalPausedDuration: true },
       });
 
-      // Calculate the duration of this pause interval
-      let additionalPausedDuration = 0;
-      if (currentStream.pausedAt) {
-        additionalPausedDuration = timestamp - currentStream.pausedAt;
-      }
+      const additionalPausedDuration = currentStream.pausedAt
+        ? timestamp - Number(currentStream.pausedAt)
+        : 0;
 
       const newTotalPausedDuration =
         currentStream.totalPausedDuration + additionalPausedDuration;
@@ -1174,7 +1303,7 @@ export class SorobanEventWorker {
             timestamp,
             metadata: JSON.stringify({
               sender,
-              newEndTime,
+              newEndTime: newEndTime.toString(),
               pausedDuration: additionalPausedDuration,
               totalPausedDuration: newTotalPausedDuration,
             }),
@@ -1190,7 +1319,7 @@ export class SorobanEventWorker {
     sseService.broadcastToStream(String(streamId), "stream.resumed", {
       streamId,
       sender,
-      newEndTime,
+      newEndTime: newEndTime.toString(),
       transactionHash: event.txHash,
       ledger: event.ledger,
       timestamp,
